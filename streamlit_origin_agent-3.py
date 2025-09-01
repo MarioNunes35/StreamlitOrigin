@@ -1,14 +1,13 @@
 
 import os
 import sys
-# Prefer pysqlite3 (bundles SQLite with FTS5) on Streamlit Cloud
+# Prefer pysqlite3 (bundled SQLite with FTS5) on Streamlit Cloud
 try:
     import pysqlite3  # type: ignore
     sys.modules['sqlite3'] = pysqlite3
 except Exception:
     pass
 import sqlite3
-import json
 from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple
@@ -45,7 +44,7 @@ def ensure_dirs_and_dbs():
     os.makedirs(DATA_DIR, exist_ok=True)
     with sqlite3.connect(DOC_DB_PATH) as con:
         cur = con.cursor()
-        cur.execute(\"\"\"
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS documents(
                 id INTEGER PRIMARY KEY,
                 filename TEXT NOT NULL,
@@ -53,8 +52,8 @@ def ensure_dirs_and_dbs():
                 n_pages INTEGER,
                 added_at TEXT
             );
-        \"\"\")
-        cur.execute(\"\"\"
+        """)
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS chunks(
                 id INTEGER PRIMARY KEY,
                 document_id INTEGER,
@@ -62,25 +61,25 @@ def ensure_dirs_and_dbs():
                 text TEXT,
                 FOREIGN KEY(document_id) REFERENCES documents(id)
             );
-        \"\"\")
+        """)
         try:
-            cur.execute(\"\"\"
+            cur.execute("""
                 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts
                 USING fts5(text, content='', tokenize='porter');
-            \"\"\" )
+            """)
             con.commit()
         except sqlite3.OperationalError:
             pass
     with sqlite3.connect(CHAT_DB_PATH) as con:
         cur = con.cursor()
-        cur.execute(\"\"\"
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS conversations(
                 id INTEGER PRIMARY KEY,
                 title TEXT,
                 created_at TEXT
             );
-        \"\"\" )
-        cur.execute(\"\"\"
+        """)
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS messages(
                 id INTEGER PRIMARY KEY,
                 conversation_id INTEGER,
@@ -89,7 +88,7 @@ def ensure_dirs_and_dbs():
                 created_at TEXT,
                 FOREIGN KEY(conversation_id) REFERENCES conversations(id)
             );
-        \"\"\" )
+        """)
         con.commit()
 
 def split_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
@@ -110,7 +109,7 @@ def extract_text_from_pdf(pdf_path: str):
     try:
         reader = PdfReader(pdf_path)
         pages = [p.extract_text() or "" for p in reader.pages]
-        return "\\n".join(pages), len(reader.pages)
+        return "\n".join(pages), len(reader.pages)
     except Exception as e:
         st.error(f"Erro ao ler {pdf_path}: {e}")
         return "", 0
@@ -158,26 +157,26 @@ def search_chunks(query: str, top_k: int = TOP_K):
     with sqlite3.connect(DOC_DB_PATH) as con:
         cur = con.cursor()
         try:
-            cur.execute(\"\"\"
+            cur.execute("""
                 SELECT c.text, c.document_id, d.filename, bm25(chunks_fts)
                 FROM chunks_fts
                 JOIN chunks c ON c.id = chunks_fts.rowid
                 JOIN documents d ON d.id = c.document_id
                 WHERE chunks_fts MATCH ?
                 ORDER BY bm25(chunks_fts) LIMIT ?
-            \"\"\", (query, top_k))
+            """, (query, top_k))
             rows = cur.fetchall()
             if rows:
                 return rows
         except sqlite3.OperationalError:
             pass
         like = f"%{query}%"
-        cur.execute(\"\"\"
+        cur.execute("""
             SELECT c.text, c.document_id, d.filename, 0.0
             FROM chunks c JOIN documents d ON d.id = c.document_id
             WHERE c.text LIKE ?
             LIMIT ?
-        \"\"\", (like, top_k))
+        """, (like, top_k))
         return cur.fetchall()
 
 def start_conversation(title: str = "Nova conversa"):
@@ -217,40 +216,35 @@ def get_messages(conversation_id: int):
 def llm_answer(question: str, context_chunks: List[str]) -> str:
     client, model = get_anthropic_client()
     system_prompt = (
-        "Você é um assistente técnico. Responda de forma direta e cite trechos relevantes do contexto quando possível. "
+        "Você é um assistente técnico. Responda de forma direta e cite trechos do contexto quando possível. "
         "Se a informação não estiver nos documentos, diga que não encontrou."
     )
-    context_text = "\\n\\n".join([f"[Trecho {i+1}] {t}" for i, t in enumerate(context_chunks)])
+    context_text = "\n\n".join([f"[Trecho {i+1}] {t}" for i, t in enumerate(context_chunks)])
     if not client:
-        return (
-            "⚠️ Nenhuma API key Anthropic encontrada. Mostrando trechos do banco de dados:\\n\\n"
-            + context_text
-        )
+        return "⚠️ Nenhuma API key Anthropic encontrada. Trechos relevantes:\n\n" + context_text
     try:
-        from anthropic import HUMAN_PROMPT, AI_PROMPT
-        prompt = (
-            f"{HUMAN_PROMPT} Responda à pergunta usando EXCLUSIVAMENTE o contexto abaixo. "
-            f"Se não houver resposta clara, diga 'não encontrei nos documentos'.\\n\\n"
-            f"Pergunta: {question}\\n\\n"
-            f"Contexto:\\n{context_text}"
-            f"{AI_PROMPT}"
-        )
+        # Messages API (Anthropic >= 0.2x)
         msg = client.messages.create(
             model=model,
             max_tokens=800,
             temperature=0.1,
-            system=system_prompt,
-            messages=[{"role": "user", "content": prompt}],
+            system=system_prompt + "\nUse EXCLUSIVAMENTE o contexto fornecido.",
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"Pergunta: {question}\n\nContexto:\n{context_text}"
+                }
+            ],
         )
         if hasattr(msg, "content"):
             parts = []
             for block in msg.content:
-                if block.type == "text":
+                if getattr(block, "type", "") == "text":
                     parts.append(block.text)
             return "".join(parts).strip() or "(sem resposta)"
         return str(msg)
     except Exception as e:
-        return f"Falha ao chamar Anthropic: {e}\\n\\n{context_text}"
+        return f"Falha ao chamar Anthropic: {e}\n\n{context_text}"
 
 def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="🧪", layout="wide")
@@ -268,7 +262,7 @@ def main():
             st.info("Configure `ANTHROPIC_API_KEY` em Secrets do Streamlit Cloud.")
 
         st.header("Indexação de PDFs")
-        docs_dir = st.text_input("Pasta com PDFs", value=DEFAULT_DOCS_DIR, help="Arquivos dentro do repositório (ex.: docs/origin)")
+        docs_dir = st.text_input("Pasta com PDFs", value=DEFAULT_DOCS_DIR, help="Arquivos do repo (ex.: docs/origin)")
         if st.button("Indexar/Atualizar banco"):
             with st.spinner("Indexando PDFs..."):
                 nd, nc = index_folder(docs_dir)
@@ -276,7 +270,7 @@ def main():
 
         st.markdown("---")
         st.subheader("Upload rápido (opcional)")
-        st.caption("No Streamlit Cloud o armazenamento é efêmero; uploads ajudam em sessões temporárias.")
+        st.caption("Armazenamento efêmero no Cloud; uploads servem para a sessão atual.")
         files = st.file_uploader("Adicione PDFs", type=["pdf"], accept_multiple_files=True)
         if files:
             os.makedirs(docs_dir, exist_ok=True)
@@ -320,7 +314,7 @@ def main():
             with st.chat_message("user" if role == "user" else "assistant"):
                 st.markdown(content)
 
-    st.caption("Obs.: Para persistência real dos bancos em Streamlit Cloud, considere sincronizar o .db com GitHub/Gist/Drive ou usar um DB externo.")
+    st.caption("Para persistência real no Cloud, considere sincronizar os .db com GitHub/Gist ou usar DB externo.")
 
 if __name__ == "__main__":
     main()
