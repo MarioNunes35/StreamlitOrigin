@@ -306,7 +306,7 @@ def main():
     with cols[1]:
         if st.button("Nova conversa"):
             st.session_state.conv_id = start_conversation("Nova conversa")
-            st.experimental_rerun()
+            st.rerun()
 
     if st.session_state.conv_id:
         msgs = get_messages(st.session_state.conv_id)
