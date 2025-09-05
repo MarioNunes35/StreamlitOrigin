@@ -1,4 +1,6 @@
 streamlit
-agno
-anthropic
 PyPDF2
+anthropic
+boto3
+botocore
+pysqlite3-binary
