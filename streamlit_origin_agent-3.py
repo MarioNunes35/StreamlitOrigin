@@ -3,6 +3,7 @@ import os
 import sys
 import hashlib
 import sqlite3
+import json
 from datetime import datetime, timedelta
 import streamlit as st
 
@@ -26,6 +27,106 @@ USER_DB_PATH = os.path.join(DATA_DIR, "users.db")
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 150
 TOP_K = 6
+
+# =============================================================================
+# CLOUDFLARE R2 STORAGE
+# =============================================================================
+
+try:
+    import boto3
+    from botocore.exceptions import ClientError
+    HAS_S3 = True
+except ImportError:
+    HAS_S3 = False
+    boto3 = None
+    ClientError = Exception
+
+def get_r2_client():
+    """Configura cliente R2 usando as mesmas variáveis do app Shiny"""
+    if not HAS_S3:
+        return None
+        
+    # Usar as mesmas variáveis de ambiente do seu app Shiny
+    endpoint = st.secrets.get("S3_ENDPOINT_URL") or os.getenv("S3_ENDPOINT_URL")
+    bucket = st.secrets.get("S3_BUCKET") or os.getenv("S3_BUCKET")
+    access_key = st.secrets.get("AWS_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID")
+    secret_key = st.secrets.get("AWS_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY")
+    
+    if not all([endpoint, bucket, access_key, secret_key]):
+        return None
+        
+    try:
+        client = boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name="auto"
+        )
+        return {"client": client, "bucket": bucket, "prefix": "origin-agent/"}
+    except Exception as e:
+        st.error(f"Erro ao conectar R2: {e}")
+        return None
+
+def r2_key(filename: str) -> str:
+    """Gera chave do R2 com prefixo"""
+    r2 = get_r2_client()
+    prefix = r2["prefix"] if r2 else "origin-agent/"
+    return f"{prefix}{filename}"
+
+def backup_to_r2():
+    """Faz backup dos DBs para R2"""
+    r2 = get_r2_client()
+    if not r2:
+        return False
+        
+    client = r2["client"]
+    bucket = r2["bucket"]
+    
+    success = True
+    for db_file in [USER_DB_PATH, DOC_DB_PATH, CHAT_DB_PATH]:
+        if os.path.exists(db_file):
+            try:
+                key = r2_key(os.path.basename(db_file))
+                client.upload_file(db_file, bucket, key)
+                print(f"[R2] Backup: {db_file} -> {key}")
+            except Exception as e:
+                print(f"[R2] Erro no backup {db_file}: {e}")
+                success = False
+    
+    return success
+
+def restore_from_r2():
+    """Restaura DBs do R2"""
+    r2 = get_r2_client()
+    if not r2:
+        return False
+        
+    client = r2["client"]
+    bucket = r2["bucket"]
+    
+    success = False
+    for db_file in [USER_DB_PATH, DOC_DB_PATH, CHAT_DB_PATH]:
+        if not os.path.exists(db_file):
+            try:
+                key = r2_key(os.path.basename(db_file))
+                client.download_file(bucket, key, db_file)
+                print(f"[R2] Restaurado: {key} -> {db_file}")
+                success = True
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'NoSuchKey':
+                    print(f"[R2] Arquivo não existe: {key}")
+                else:
+                    print(f"[R2] Erro ao restaurar {key}: {e}")
+            except Exception as e:
+                print(f"[R2] Erro genérico ao restaurar {key}: {e}")
+    
+    return success
+
+def sync_user_data():
+    """Sincroniza dados do usuário com R2 automaticamente"""
+    if get_r2_client():
+        backup_to_r2()
 
 # =============================================================================
 # SISTEMA DE AUTENTICAÇÃO
@@ -64,6 +165,9 @@ def create_user_db():
                   (datetime.utcnow() + timedelta(days=365)).isoformat()))
         
         con.commit()
+    
+    # Backup automático para R2
+    sync_user_data()
 
 def validate_user(username: str, password: str) -> bool:
     """Valida credenciais do usuário"""
@@ -106,6 +210,9 @@ def validate_user(username: str, password: str) -> bool:
         )
         con.commit()
         
+        # Backup após atualização
+        sync_user_data()
+        
         return True
 
 def add_user(username: str, password: str, email: str = "", months: int = 12) -> bool:
@@ -123,6 +230,9 @@ def add_user(username: str, password: str, email: str = "", months: int = 12) ->
             """, (username, hash_password(password), email, 
                   datetime.utcnow().isoformat(), expiry.isoformat()))
             con.commit()
+            
+            # Backup após criação
+            sync_user_data()
             return True
         except sqlite3.IntegrityError:
             return False
@@ -155,13 +265,13 @@ def show_login_page():
         with st.container():
             st.markdown("### Login")
             
-            username = st.text_input("👤 Usuário", placeholder="Digite seu usuário")
-            password = st.text_input("🔑 Senha", type="password", placeholder="Digite sua senha")
+            username = st.text_input("👤 Usuário", placeholder="Digite seu usuário", key="login_username")
+            password = st.text_input("🔑 Senha", type="password", placeholder="Digite sua senha", key="login_password")
             
             col_login, col_demo = st.columns(2)
             
             with col_login:
-                if st.button("🚀 Entrar", use_container_width=True):
+                if st.button("🚀 Entrar", use_container_width=True, key="login_button"):
                     if validate_user(username, password):
                         st.session_state.authenticated = True
                         st.session_state.username = username
@@ -171,7 +281,7 @@ def show_login_page():
                         st.error("❌ Usuário ou senha incorretos")
             
             with col_demo:
-                if st.button("👁️ Demo", use_container_width=True):
+                if st.button("👁️ Demo", use_container_width=True, key="demo_button"):
                     st.info("""
                     **Conta Demo:**
                     - Usuário: `admin`
@@ -184,6 +294,29 @@ def show_admin_panel():
         return
         
     st.subheader("🛠️ Painel Administrativo")
+    
+    # Status do R2
+    r2 = get_r2_client()
+    if r2:
+        st.success("☁️ Cloudflare R2 conectado - Dados sincronizados automaticamente")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("📤 Backup Manual para R2", key="manual_backup"):
+                if backup_to_r2():
+                    st.success("✅ Backup realizado com sucesso!")
+                else:
+                    st.error("❌ Erro no backup")
+        
+        with col2:
+            if st.button("📥 Restaurar do R2", key="manual_restore"):
+                if restore_from_r2():
+                    st.success("✅ Dados restaurados com sucesso!")
+                    st.rerun()
+                else:
+                    st.warning("⚠️ Nenhum backup encontrado no R2")
+    else:
+        st.warning("⚠️ R2 não configurado - Configure as variáveis de ambiente S3")
     
     tab1, tab2 = st.tabs(["👥 Usuários", "➕ Adicionar Usuário"])
     
@@ -206,12 +339,12 @@ def show_admin_panel():
     with tab2:
         st.markdown("### Adicionar Novo Usuário")
         
-        new_username = st.text_input("Nome de usuário")
-        new_password = st.text_input("Senha", type="password")
-        new_email = st.text_input("Email (opcional)")
-        new_months = st.number_input("Meses de acesso", min_value=1, max_value=36, value=12)
+        new_username = st.text_input("Nome de usuário", key="admin_new_username")
+        new_password = st.text_input("Senha", type="password", key="admin_new_password")
+        new_email = st.text_input("Email (opcional)", key="admin_new_email")
+        new_months = st.number_input("Meses de acesso", min_value=1, max_value=36, value=12, key="admin_new_months")
         
-        if st.button("Criar Usuário"):
+        if st.button("Criar Usuário", key="admin_create_user"):
             if new_username and new_password:
                 if add_user(new_username, new_password, new_email, new_months):
                     st.success(f"✅ Usuário '{new_username}' criado com sucesso!")
@@ -244,7 +377,12 @@ def get_anthropic_client():
 
 def ensure_dirs_and_dbs():
     os.makedirs(DATA_DIR, exist_ok=True)
-    create_user_db()  # Criar DB de usuários
+    
+    # Primeiro tenta restaurar do R2
+    restore_from_r2()
+    
+    # Depois cria estruturas se necessário
+    create_user_db()
     
     with sqlite3.connect(DOC_DB_PATH) as con:
         cur = con.cursor()
@@ -353,6 +491,9 @@ def index_folder(folder: str):
                 new_chunks += 1
             new_docs += 1
         con.commit()
+    
+    # Backup após indexação
+    backup_to_r2()
     return new_docs, new_chunks
 
 def search_chunks(query: str, top_k: int = TOP_K):
@@ -392,6 +533,8 @@ def start_conversation(title: str = "Nova conversa"):
             (title, datetime.utcnow().isoformat())
         )
         con.commit()
+        # Backup após nova conversa
+        backup_to_r2()
         return cur.lastrowid
 
 def add_message(conversation_id: int, role: str, content: str):
@@ -462,12 +605,12 @@ def main():
     
     # Interface principal (usuário autenticado)
     st.title(f"🧪 {APP_TITLE}")
-    st.caption(f"Bem-vindo, **{st.session_state.username}**!")
+    st.caption(f"Bem-vindo, **{st.session_state.username}**! | Dados sincronizados com Cloudflare R2")
     
     # Botão de logout no topo
     col1, col2, col3 = st.columns([1, 1, 1])
     with col3:
-        if st.button("🚪 Logout"):
+        if st.button("🚪 Logout", key="main_logout"):
             for key in ['authenticated', 'username', 'conv_id']:
                 if key in st.session_state:
                     del st.session_state[key]
@@ -489,15 +632,15 @@ def main():
             st.info("Configure `ANTHROPIC_API_KEY` em Secrets do Streamlit Cloud.")
 
         st.header("Indexação de PDFs")
-        docs_dir = st.text_input("Pasta com PDFs", value=DEFAULT_DOCS_DIR)
-        if st.button("Indexar/Atualizar banco"):
+        docs_dir = st.text_input("Pasta com PDFs", value=DEFAULT_DOCS_DIR, key="sidebar_docs_dir")
+        if st.button("Indexar/Atualizar banco", key="sidebar_index"):
             with st.spinner("Indexando PDFs..."):
                 nd, nc = index_folder(docs_dir)
             st.success(f"Indexação: {nd} documentos, {nc} trechos.")
 
         st.markdown("---")
         st.subheader("Upload rápido (opcional)")
-        files = st.file_uploader("Adicione PDFs", type=["pdf"], accept_multiple_files=True)
+        files = st.file_uploader("Adicione PDFs", type=["pdf"], accept_multiple_files=True, key="sidebar_upload")
         if files:
             os.makedirs(docs_dir, exist_ok=True)
             saved = 0
@@ -512,8 +655,8 @@ def main():
         st.session_state.conv_id = start_conversation("Perguntas sobre Origin")
 
     st.subheader("Pergunte com base nos PDFs")
-    question = st.text_input("Digite sua pergunta:", placeholder="Ex.: Como importar dados do Excel no Origin?")
-    if st.button("Responder") and question.strip():
+    question = st.text_input("Digite sua pergunta:", placeholder="Ex.: Como importar dados do Excel no Origin?", key="main_question")
+    if st.button("Responder", key="main_answer") and question.strip():
         add_message(st.session_state.conv_id, "user", question.strip())
         rows = search_chunks(question, TOP_K)
         context_chunks = [r[0] for r in rows]
@@ -539,11 +682,6 @@ def main():
         for role, content, created in msgs:
             with st.chat_message("user" if role == "user" else "assistant"):
                 st.markdown(content)
-
-if __name__ == "__main__":
-    main()
-
-    st.caption("Para persistência real no Cloud, considere sincronizar os .db com GitHub/Gist ou usar DB externo.")
 
 if __name__ == "__main__":
     main()
