@@ -527,10 +527,10 @@ def main():
         convs = list_conversations()
         if convs:
             labels = [f"#{cid} — {title} ({created_at.split('T')[0]})" for cid, title, created_at in convs]
-            idx = st.selectbox("Escolha uma conversa:", options=list(range(len(convs))), format_func=lambda i: labels[i])
+            idx = st.selectbox("Escolha uma conversa:", options=list(range(len(convs))), format_func=lambda i: labels[i], key="main_conv_select")
             st.session_state.conv_id = convs[idx][0]
     with cols[1]:
-        if st.button("Nova conversa"):
+        if st.button("Nova conversa", key="main_new_conv"):
             st.session_state.conv_id = start_conversation("Nova conversa")
             st.rerun()
 
