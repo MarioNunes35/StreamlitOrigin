@@ -1,27 +1,229 @@
 
 import os
 import sys
+import hashlib
+import sqlite3
+from datetime import datetime, timedelta
+import streamlit as st
+
 # Prefer pysqlite3 (bundled SQLite with FTS5) on Streamlit Cloud
 try:
     import pysqlite3  # type: ignore
     sys.modules['sqlite3'] = pysqlite3
 except Exception:
     pass
-import sqlite3
-from datetime import datetime
+
+from PyPDF2 import PdfReader
 from pathlib import Path
 from typing import List, Tuple
-import streamlit as st
-from PyPDF2 import PdfReader
 
 APP_TITLE = "Origin Software Agent"
 DEFAULT_DOCS_DIR = "docs/origin"
 DATA_DIR = "data"
 DOC_DB_PATH = os.path.join(DATA_DIR, "documents.db")
 CHAT_DB_PATH = os.path.join(DATA_DIR, "chat.db")
+USER_DB_PATH = os.path.join(DATA_DIR, "users.db")
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 150
 TOP_K = 6
+
+# =============================================================================
+# SISTEMA DE AUTENTICAÇÃO
+# =============================================================================
+
+def hash_password(password: str) -> str:
+    """Cria hash seguro da senha"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def create_user_db():
+    """Cria tabela de usuários"""
+    with sqlite3.connect(USER_DB_PATH) as con:
+        cur = con.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users(
+                id INTEGER PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                email TEXT,
+                created_at TEXT,
+                last_login TEXT,
+                active INTEGER DEFAULT 1,
+                subscription_expires TEXT
+            );
+        """)
+        
+        # Criar usuário admin padrão se não existir
+        cur.execute("SELECT id FROM users WHERE username = 'admin'")
+        if not cur.fetchone():
+            admin_pass = hash_password("admin123")  # MUDE ESTA SENHA!
+            cur.execute("""
+                INSERT INTO users(username, password_hash, email, created_at, active, subscription_expires)
+                VALUES(?, ?, ?, ?, 1, ?)
+            """, ("admin", admin_pass, "admin@origin.com", 
+                  datetime.utcnow().isoformat(),
+                  (datetime.utcnow() + timedelta(days=365)).isoformat()))
+        
+        con.commit()
+
+def validate_user(username: str, password: str) -> bool:
+    """Valida credenciais do usuário"""
+    if not username or not password:
+        return False
+        
+    with sqlite3.connect(USER_DB_PATH) as con:
+        cur = con.cursor()
+        cur.execute("""
+            SELECT password_hash, active, subscription_expires 
+            FROM users WHERE username = ?
+        """, (username,))
+        result = cur.fetchone()
+        
+        if not result:
+            return False
+            
+        password_hash, active, subscription_expires = result
+        
+        # Verificar senha
+        if hash_password(password) != password_hash:
+            return False
+            
+        # Verificar se usuário está ativo
+        if not active:
+            st.error("Usuário desativado. Entre em contato com o suporte.")
+            return False
+            
+        # Verificar se assinatura não expirou
+        if subscription_expires:
+            expiry = datetime.fromisoformat(subscription_expires)
+            if datetime.utcnow() > expiry:
+                st.error("Assinatura expirada. Renove seu acesso.")
+                return False
+        
+        # Atualizar último login
+        cur.execute(
+            "UPDATE users SET last_login = ? WHERE username = ?",
+            (datetime.utcnow().isoformat(), username)
+        )
+        con.commit()
+        
+        return True
+
+def add_user(username: str, password: str, email: str = "", months: int = 12) -> bool:
+    """Adiciona novo usuário (apenas admin)"""
+    if 'username' not in st.session_state or st.session_state.username != 'admin':
+        return False
+        
+    with sqlite3.connect(USER_DB_PATH) as con:
+        cur = con.cursor()
+        try:
+            expiry = datetime.utcnow() + timedelta(days=30*months)
+            cur.execute("""
+                INSERT INTO users(username, password_hash, email, created_at, active, subscription_expires)
+                VALUES(?, ?, ?, ?, 1, ?)
+            """, (username, hash_password(password), email, 
+                  datetime.utcnow().isoformat(), expiry.isoformat()))
+            con.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+def list_users():
+    """Lista usuários (apenas admin)"""
+    if 'username' not in st.session_state or st.session_state.username != 'admin':
+        return []
+        
+    with sqlite3.connect(USER_DB_PATH) as con:
+        cur = con.cursor()
+        cur.execute("""
+            SELECT username, email, created_at, last_login, active, subscription_expires
+            FROM users ORDER BY created_at DESC
+        """)
+        return cur.fetchall()
+
+def show_login_page():
+    """Página de login"""
+    st.markdown("""
+    <div style="text-align: center; padding: 2rem;">
+        <h1>🔐 Origin Software Agent</h1>
+        <p>Entre com suas credenciais para acessar o sistema</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    with col2:
+        with st.container():
+            st.markdown("### Login")
+            
+            username = st.text_input("👤 Usuário", placeholder="Digite seu usuário")
+            password = st.text_input("🔑 Senha", type="password", placeholder="Digite sua senha")
+            
+            col_login, col_demo = st.columns(2)
+            
+            with col_login:
+                if st.button("🚀 Entrar", use_container_width=True):
+                    if validate_user(username, password):
+                        st.session_state.authenticated = True
+                        st.session_state.username = username
+                        st.success("Login realizado com sucesso!")
+                        st.rerun()
+                    else:
+                        st.error("❌ Usuário ou senha incorretos")
+            
+            with col_demo:
+                if st.button("👁️ Demo", use_container_width=True):
+                    st.info("""
+                    **Conta Demo:**
+                    - Usuário: `admin`
+                    - Senha: `admin123`
+                    """)
+
+def show_admin_panel():
+    """Painel administrativo"""
+    if st.session_state.username != 'admin':
+        return
+        
+    st.subheader("🛠️ Painel Administrativo")
+    
+    tab1, tab2 = st.tabs(["👥 Usuários", "➕ Adicionar Usuário"])
+    
+    with tab1:
+        users = list_users()
+        if users:
+            st.markdown("### Usuários Cadastrados")
+            for user in users:
+                username, email, created, last_login, active, expires = user
+                
+                with st.expander(f"👤 {username} {'✅' if active else '❌'}"):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.write(f"**Email:** {email or 'Não informado'}")
+                        st.write(f"**Criado:** {created[:10] if created else 'N/A'}")
+                    with col2:
+                        st.write(f"**Último login:** {last_login[:10] if last_login else 'Nunca'}")
+                        st.write(f"**Expira:** {expires[:10] if expires else 'Nunca'}")
+    
+    with tab2:
+        st.markdown("### Adicionar Novo Usuário")
+        
+        new_username = st.text_input("Nome de usuário")
+        new_password = st.text_input("Senha", type="password")
+        new_email = st.text_input("Email (opcional)")
+        new_months = st.number_input("Meses de acesso", min_value=1, max_value=36, value=12)
+        
+        if st.button("Criar Usuário"):
+            if new_username and new_password:
+                if add_user(new_username, new_password, new_email, new_months):
+                    st.success(f"✅ Usuário '{new_username}' criado com sucesso!")
+                    st.rerun()
+                else:
+                    st.error("❌ Erro ao criar usuário (nome já existe?)")
+            else:
+                st.error("❌ Usuário e senha são obrigatórios")
+
+# =============================================================================
+# FUNÇÕES ORIGINAIS (mantidas)
+# =============================================================================
 
 def get_anthropic_client():
     api_key = None
@@ -42,6 +244,8 @@ def get_anthropic_client():
 
 def ensure_dirs_and_dbs():
     os.makedirs(DATA_DIR, exist_ok=True)
+    create_user_db()  # Criar DB de usuários
+    
     with sqlite3.connect(DOC_DB_PATH) as con:
         cur = con.cursor()
         cur.execute("""
@@ -70,6 +274,7 @@ def ensure_dirs_and_dbs():
             con.commit()
         except sqlite3.OperationalError:
             pass
+    
     with sqlite3.connect(CHAT_DB_PATH) as con:
         cur = con.cursor()
         cur.execute("""
@@ -223,7 +428,6 @@ def llm_answer(question: str, context_chunks: List[str]) -> str:
     if not client:
         return "⚠️ Nenhuma API key Anthropic encontrada. Trechos relevantes:\n\n" + context_text
     try:
-        # Messages API (Anthropic >= 0.2x)
         msg = client.messages.create(
             model=model,
             max_tokens=800,
@@ -248,11 +452,34 @@ def llm_answer(question: str, context_chunks: List[str]) -> str:
 
 def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="🧪", layout="wide")
-    st.title(APP_TITLE)
-    st.caption("Assistente (Streamlit Cloud) — PDFs da pasta + SQLite, sem pedir API na interface.")
-
+    
     ensure_dirs_and_dbs()
+    
+    # Verificar autenticação
+    if 'authenticated' not in st.session_state or not st.session_state.authenticated:
+        show_login_page()
+        return
+    
+    # Interface principal (usuário autenticado)
+    st.title(f"🧪 {APP_TITLE}")
+    st.caption(f"Bem-vindo, **{st.session_state.username}**!")
+    
+    # Botão de logout no topo
+    col1, col2, col3 = st.columns([1, 1, 1])
+    with col3:
+        if st.button("🚪 Logout"):
+            for key in ['authenticated', 'username', 'conv_id']:
+                if key in st.session_state:
+                    del st.session_state[key]
+            st.rerun()
+    
+    # Painel admin (apenas para admin)
+    if st.session_state.username == 'admin':
+        with st.expander("🛠️ Painel Administrativo"):
+            show_admin_panel()
+        st.divider()
 
+    # Interface original do app
     with st.sidebar:
         st.header("Configuração")
         client, model = get_anthropic_client()
@@ -262,7 +489,7 @@ def main():
             st.info("Configure `ANTHROPIC_API_KEY` em Secrets do Streamlit Cloud.")
 
         st.header("Indexação de PDFs")
-        docs_dir = st.text_input("Pasta com PDFs", value=DEFAULT_DOCS_DIR, help="Arquivos do repo (ex.: docs/origin)")
+        docs_dir = st.text_input("Pasta com PDFs", value=DEFAULT_DOCS_DIR)
         if st.button("Indexar/Atualizar banco"):
             with st.spinner("Indexando PDFs..."):
                 nd, nc = index_folder(docs_dir)
@@ -270,7 +497,6 @@ def main():
 
         st.markdown("---")
         st.subheader("Upload rápido (opcional)")
-        st.caption("Armazenamento efêmero no Cloud; uploads servem para a sessão atual.")
         files = st.file_uploader("Adicione PDFs", type=["pdf"], accept_multiple_files=True)
         if files:
             os.makedirs(docs_dir, exist_ok=True)
@@ -285,7 +511,7 @@ def main():
     if "conv_id" not in st.session_state:
         st.session_state.conv_id = start_conversation("Perguntas sobre Origin")
 
-    st.subheader("Pergunte com base nos PDFs (Questionário)")
+    st.subheader("Pergunte com base nos PDFs")
     question = st.text_input("Digite sua pergunta:", placeholder="Ex.: Como importar dados do Excel no Origin?")
     if st.button("Responder") and question.strip():
         add_message(st.session_state.conv_id, "user", question.strip())
@@ -313,6 +539,9 @@ def main():
         for role, content, created in msgs:
             with st.chat_message("user" if role == "user" else "assistant"):
                 st.markdown(content)
+
+if __name__ == "__main__":
+    main()
 
     st.caption("Para persistência real no Cloud, considere sincronizar os .db com GitHub/Gist ou usar DB externo.")
 
