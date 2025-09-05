@@ -768,4 +768,90 @@ def main():
         return
     
     # Interface principal (usuário autenticado)
-    st.title(f"🧪 {APP_
+    st.title(f"🧪 {APP_TITLE}")
+    
+    # Mostrar status do R2
+    r2_status = test_r2_connection()
+    if r2_status['status'] == 'success':
+        st.caption(f"Bem-vindo, **{st.session_state.username}**! | ☁️ Dados sincronizados com R2")
+    else:
+        st.caption(f"Bem-vindo, **{st.session_state.username}**! | ⚠️ R2 offline (dados locais)")
+    
+    # Botão de logout no topo
+    col1, col2, col3 = st.columns([1, 1, 1])
+    with col3:
+        if st.button("🚪 Logout", key="main_logout"):
+            for key in ['authenticated', 'username', 'conv_id']:
+                if key in st.session_state:
+                    del st.session_state[key]
+            st.rerun()
+    
+    # Painel admin (apenas para admin)
+    if st.session_state.username == 'admin':
+        with st.expander("🛠️ Painel Administrativo"):
+            show_admin_panel()
+        st.divider()
+
+    # Interface original do app
+    with st.sidebar:
+        st.header("Configuração")
+        client, model = get_anthropic_client()
+        if client:
+            st.success(f"Anthropic configurado ({model})")
+        else:
+            st.info("Configure `ANTHROPIC_API_KEY` em Secrets do Streamlit Cloud.")
+
+        st.header("Indexação de PDFs")
+        docs_dir = st.text_input("Pasta com PDFs", value=DEFAULT_DOCS_DIR, key="sidebar_docs_dir")
+        if st.button("Indexar/Atualizar banco", key="sidebar_index"):
+            with st.spinner("Indexando PDFs..."):
+                nd, nc = index_folder(docs_dir)
+            st.success(f"Indexação: {nd} documentos, {nc} trechos.")
+
+        st.markdown("---")
+        st.subheader("Upload rápido (opcional)")
+        files = st.file_uploader("Adicione PDFs", type=["pdf"], accept_multiple_files=True, key="sidebar_upload")
+        if files:
+            os.makedirs(docs_dir, exist_ok=True)
+            saved = 0
+            for f in files:
+                out = os.path.join(docs_dir, f.name)
+                with open(out, "wb") as w:
+                    w.write(f.read())
+                saved += 1
+            st.success(f"{saved} PDF(s) salvo(s) em {docs_dir}. Clique em 'Indexar/Atualizar banco'.")
+
+    if "conv_id" not in st.session_state:
+        st.session_state.conv_id = start_conversation("Perguntas sobre Origin")
+
+    st.subheader("Pergunte com base nos PDFs")
+    question = st.text_input("Digite sua pergunta:", placeholder="Ex.: Como importar dados do Excel no Origin?", key="main_question")
+    if st.button("Responder", key="main_answer") and question.strip():
+        add_message(st.session_state.conv_id, "user", question.strip())
+        rows = search_chunks(question, TOP_K)
+        context_chunks = [r[0] for r in rows]
+        answer = llm_answer(question.strip(), context_chunks)
+        add_message(st.session_state.conv_id, "assistant", answer)
+
+    st.divider()
+    st.subheader("Conversas salvas")
+    cols = st.columns([3,1])
+    with cols[0]:
+        convs = list_conversations()
+        if convs:
+            labels = [f"#{cid} — {title} ({created_at.split('T')[0]})" for cid, title, created_at in convs]
+            idx = st.selectbox("Escolha uma conversa:", options=list(range(len(convs))), format_func=lambda i: labels[i], key="main_conv_select")
+            st.session_state.conv_id = convs[idx][0]
+    with cols[1]:
+        if st.button("Nova conversa", key="main_new_conv"):
+            st.session_state.conv_id = start_conversation("Nova conversa")
+            st.rerun()
+
+    if st.session_state.conv_id:
+        msgs = get_messages(st.session_state.conv_id)
+        for role, content, created in msgs:
+            with st.chat_message("user" if role == "user" else "assistant"):
+                st.markdown(content)
+
+if __name__ == "__main__":
+    main()
