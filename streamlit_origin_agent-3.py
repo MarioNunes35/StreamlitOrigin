@@ -16,7 +16,7 @@ except Exception:
 
 from PyPDF2 import PdfReader
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Dict
 
 APP_TITLE = "Origin Software Agent"
 DEFAULT_DOCS_DIR = "docs/origin"
@@ -29,43 +29,106 @@ CHUNK_OVERLAP = 150
 TOP_K = 6
 
 # =============================================================================
-# CLOUDFLARE R2 STORAGE
+# CLOUDFLARE R2 STORAGE - VERSÃO CORRIGIDA
 # =============================================================================
 
 try:
     import boto3
-    from botocore.exceptions import ClientError
+    from botocore.exceptions import ClientError, NoCredentialsError
+    from botocore.config import Config
     HAS_S3 = True
 except ImportError:
     HAS_S3 = False
     boto3 = None
     ClientError = Exception
+    NoCredentialsError = Exception
 
-def get_r2_client():
-    """Configura cliente R2 usando as mesmas variáveis do app Shiny"""
+def get_r2_config() -> Optional[Dict]:
+    """Obtém configuração do R2 de forma robusta"""
     if not HAS_S3:
         return None
-        
-    # Usar as mesmas variáveis de ambiente do seu app Shiny
-    endpoint = st.secrets.get("S3_ENDPOINT_URL") or os.getenv("S3_ENDPOINT_URL")
-    bucket = st.secrets.get("S3_BUCKET") or os.getenv("S3_BUCKET")
-    access_key = st.secrets.get("AWS_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID")
-    secret_key = st.secrets.get("AWS_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY")
     
-    if not all([endpoint, bucket, access_key, secret_key]):
-        return None
-        
+    # Tentar múltiplas formas de obter as configurações
+    config = {}
+    
+    # 1. Primeiro tenta st.secrets
     try:
+        if hasattr(st, 'secrets'):
+            config['endpoint'] = st.secrets.get("S3_ENDPOINT_URL", "")
+            config['bucket'] = st.secrets.get("S3_BUCKET", "")
+            config['access_key'] = st.secrets.get("AWS_ACCESS_KEY_ID", "")
+            config['secret_key'] = st.secrets.get("AWS_SECRET_ACCESS_KEY", "")
+            config['region'] = st.secrets.get("S3_REGION", "auto")
+    except Exception:
+        pass
+    
+    # 2. Se algum valor estiver vazio, tenta variáveis de ambiente
+    if not config.get('endpoint'):
+        config['endpoint'] = os.getenv("S3_ENDPOINT_URL", "")
+    if not config.get('bucket'):
+        config['bucket'] = os.getenv("S3_BUCKET", "")
+    if not config.get('access_key'):
+        config['access_key'] = os.getenv("AWS_ACCESS_KEY_ID", "")
+    if not config.get('secret_key'):
+        config['secret_key'] = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+    if not config.get('region'):
+        config['region'] = os.getenv("S3_REGION", "auto")
+    
+    # Validar se todas as configurações necessárias estão presentes
+    required = ['endpoint', 'bucket', 'access_key', 'secret_key']
+    for key in required:
+        if not config.get(key):
+            return None
+    
+    return config
+
+def get_r2_client():
+    """Configura cliente R2 com tratamento de erros melhorado"""
+    if not HAS_S3:
+        return None
+    
+    config = get_r2_config()
+    if not config:
+        return None
+    
+    try:
+        # Configuração específica para R2
+        boto_config = Config(
+            signature_version='s3v4',
+            retries={'max_attempts': 3, 'mode': 'standard'}
+        )
+        
         client = boto3.client(
             "s3",
-            endpoint_url=endpoint,
-            aws_access_key_id=access_key,
-            aws_secret_access_key=secret_key,
-            region_name="auto"
+            endpoint_url=config['endpoint'],
+            aws_access_key_id=config['access_key'],
+            aws_secret_access_key=config['secret_key'],
+            region_name=config.get('region', 'auto'),
+            config=boto_config
         )
-        return {"client": client, "bucket": bucket, "prefix": "origin-agent/"}
+        
+        # Testar conexão
+        try:
+            client.head_bucket(Bucket=config['bucket'])
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', '')
+            if error_code == '404':
+                # Bucket não existe, tentar criar
+                try:
+                    client.create_bucket(Bucket=config['bucket'])
+                except Exception:
+                    pass
+            elif error_code != '403':  # 403 pode significar que existe mas sem permissão de head
+                return None
+        
+        return {
+            "client": client, 
+            "bucket": config['bucket'], 
+            "prefix": "origin-agent/"
+        }
+        
     except Exception as e:
-        st.error(f"Erro ao conectar R2: {e}")
+        print(f"[R2] Erro ao conectar: {str(e)}")
         return None
 
 def r2_key(filename: str) -> str:
@@ -79,7 +142,7 @@ def backup_to_r2():
     r2 = get_r2_client()
     if not r2:
         return False
-        
+    
     client = r2["client"]
     bucket = r2["bucket"]
     
@@ -91,7 +154,7 @@ def backup_to_r2():
                 client.upload_file(db_file, bucket, key)
                 print(f"[R2] Backup: {db_file} -> {key}")
             except Exception as e:
-                print(f"[R2] Erro no backup {db_file}: {e}")
+                print(f"[R2] Erro no backup {db_file}: {str(e)}")
                 success = False
     
     return success
@@ -101,7 +164,7 @@ def restore_from_r2():
     r2 = get_r2_client()
     if not r2:
         return False
-        
+    
     client = r2["client"]
     bucket = r2["bucket"]
     
@@ -114,12 +177,13 @@ def restore_from_r2():
                 print(f"[R2] Restaurado: {key} -> {db_file}")
                 success = True
             except ClientError as e:
-                if e.response['Error']['Code'] == 'NoSuchKey':
+                error_code = e.response.get('Error', {}).get('Code', '')
+                if error_code == 'NoSuchKey':
                     print(f"[R2] Arquivo não existe: {key}")
                 else:
-                    print(f"[R2] Erro ao restaurar {key}: {e}")
+                    print(f"[R2] Erro ao restaurar {key}: {str(e)}")
             except Exception as e:
-                print(f"[R2] Erro genérico ao restaurar {key}: {e}")
+                print(f"[R2] Erro genérico ao restaurar {key}: {str(e)}")
     
     return success
 
@@ -127,6 +191,38 @@ def sync_user_data():
     """Sincroniza dados do usuário com R2 automaticamente"""
     if get_r2_client():
         backup_to_r2()
+
+def test_r2_connection():
+    """Testa e retorna status detalhado da conexão R2"""
+    if not HAS_S3:
+        return {"status": "error", "message": "boto3 não instalado"}
+    
+    config = get_r2_config()
+    if not config:
+        missing = []
+        test_config = get_r2_config() or {}
+        for key in ['endpoint', 'bucket', 'access_key', 'secret_key']:
+            if not test_config.get(key):
+                missing.append(key.upper())
+        return {
+            "status": "error", 
+            "message": f"Configurações faltando: {', '.join(missing)}"
+        }
+    
+    # Tentar conectar
+    r2 = get_r2_client()
+    if r2:
+        return {
+            "status": "success",
+            "message": "Conectado com sucesso",
+            "bucket": config['bucket'],
+            "endpoint": config['endpoint']
+        }
+    else:
+        return {
+            "status": "error",
+            "message": "Falha na conexão - verifique as credenciais"
+        }
 
 # =============================================================================
 # SISTEMA DE AUTENTICAÇÃO
@@ -173,7 +269,7 @@ def validate_user(username: str, password: str) -> bool:
     """Valida credenciais do usuário"""
     if not username or not password:
         return False
-        
+    
     with sqlite3.connect(USER_DB_PATH) as con:
         cur = con.cursor()
         cur.execute("""
@@ -184,18 +280,18 @@ def validate_user(username: str, password: str) -> bool:
         
         if not result:
             return False
-            
+        
         password_hash, active, subscription_expires = result
         
         # Verificar senha
         if hash_password(password) != password_hash:
             return False
-            
+        
         # Verificar se usuário está ativo
         if not active:
             st.error("Usuário desativado. Entre em contato com o suporte.")
             return False
-            
+        
         # Verificar se assinatura não expirou
         if subscription_expires:
             expiry = datetime.fromisoformat(subscription_expires)
@@ -219,7 +315,7 @@ def add_user(username: str, password: str, email: str = "", months: int = 12) ->
     """Adiciona novo usuário (apenas admin)"""
     if 'username' not in st.session_state or st.session_state.username != 'admin':
         return False
-        
+    
     with sqlite3.connect(USER_DB_PATH) as con:
         cur = con.cursor()
         try:
@@ -241,7 +337,7 @@ def list_users():
     """Lista usuários (apenas admin)"""
     if 'username' not in st.session_state or st.session_state.username != 'admin':
         return []
-        
+    
     with sqlite3.connect(USER_DB_PATH) as con:
         cur = con.cursor()
         cur.execute("""
@@ -289,35 +385,85 @@ def show_login_page():
                     """)
 
 def show_admin_panel():
-    """Painel administrativo"""
+    """Painel administrativo com diagnóstico melhorado"""
     if st.session_state.username != 'admin':
         return
-        
+    
     st.subheader("🛠️ Painel Administrativo")
     
-    # Status do R2
-    r2 = get_r2_client()
-    if r2:
-        st.success("☁️ Cloudflare R2 conectado - Dados sincronizados automaticamente")
+    # Status detalhado do R2
+    r2_status = test_r2_connection()
+    
+    if r2_status['status'] == 'success':
+        st.success(f"☁️ Cloudflare R2 conectado - Bucket: {r2_status['bucket']}")
         
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         with col1:
-            if st.button("📤 Backup Manual para R2", key="manual_backup"):
-                if backup_to_r2():
-                    st.success("✅ Backup realizado com sucesso!")
-                else:
-                    st.error("❌ Erro no backup")
+            if st.button("📤 Backup Manual", key="manual_backup"):
+                with st.spinner("Fazendo backup..."):
+                    if backup_to_r2():
+                        st.success("✅ Backup realizado!")
+                    else:
+                        st.error("❌ Erro no backup")
         
         with col2:
-            if st.button("📥 Restaurar do R2", key="manual_restore"):
-                if restore_from_r2():
-                    st.success("✅ Dados restaurados com sucesso!")
-                    st.rerun()
-                else:
-                    st.warning("⚠️ Nenhum backup encontrado no R2")
+            if st.button("📥 Restaurar", key="manual_restore"):
+                with st.spinner("Restaurando..."):
+                    if restore_from_r2():
+                        st.success("✅ Restaurado!")
+                        st.rerun()
+                    else:
+                        st.warning("⚠️ Nenhum backup encontrado")
+        
+        with col3:
+            if st.button("🔄 Testar Conexão", key="test_connection"):
+                st.rerun()
     else:
-        st.warning("⚠️ R2 não configurado - Configure as variáveis de ambiente S3")
+        st.error(f"❌ R2 não conectado: {r2_status['message']}")
+        
+        # Mostrar instruções de configuração
+        with st.expander("📋 Como configurar o R2"):
+            st.markdown("""
+            ### Configuração no Streamlit Cloud:
+            
+            1. **Vá para Settings > Secrets** no seu app
+            2. **Adicione as seguintes variáveis:**
+            
+            ```toml
+            S3_ENDPOINT_URL = "https://[seu-account-id].r2.cloudflarestorage.com"
+            S3_BUCKET = "seu-bucket-name"
+            AWS_ACCESS_KEY_ID = "sua-access-key"
+            AWS_SECRET_ACCESS_KEY = "sua-secret-key"
+            S3_REGION = "auto"
+            ```
+            
+            3. **Onde encontrar essas informações:**
+               - Acesse o dashboard do Cloudflare
+               - Vá para R2 Object Storage
+               - Crie um bucket se não tiver
+               - Em "Manage R2 API Tokens", crie um token
+               - Use as credenciais geradas
+            
+            4. **Reinicie o app após adicionar os secrets**
+            """)
+            
+            # Debug info para admin
+            if st.checkbox("🔍 Mostrar diagnóstico detalhado"):
+                st.code(f"""
+                Configurações detectadas:
+                - boto3 instalado: {HAS_S3}
+                - Método de config: {'st.secrets' if hasattr(st, 'secrets') else 'env vars'}
+                
+                Valores encontrados (parcial):
+                - S3_ENDPOINT_URL: {'✓' if get_r2_config() and get_r2_config().get('endpoint') else '✗'}
+                - S3_BUCKET: {'✓' if get_r2_config() and get_r2_config().get('bucket') else '✗'}
+                - AWS_ACCESS_KEY_ID: {'✓' if get_r2_config() and get_r2_config().get('access_key') else '✗'}
+                - AWS_SECRET_ACCESS_KEY: {'✓' if get_r2_config() and get_r2_config().get('secret_key') else '✗'}
+                """)
     
+    st.divider()
+    
+    # Gerenciamento de usuários
     tab1, tab2 = st.tabs(["👥 Usuários", "➕ Adicionar Usuário"])
     
     with tab1:
@@ -359,23 +505,41 @@ def show_admin_panel():
 # =============================================================================
 
 def get_anthropic_client():
+    """Obtém cliente Anthropic de forma robusta"""
     api_key = None
-    if "ANTHROPIC_API_KEY" in st.secrets:
-        api_key = st.secrets["ANTHROPIC_API_KEY"]
+    
+    # Tentar várias formas de obter a API key
+    try:
+        if hasattr(st, 'secrets') and "ANTHROPIC_API_KEY" in st.secrets:
+            api_key = st.secrets["ANTHROPIC_API_KEY"]
+    except Exception:
+        pass
+    
     if not api_key:
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    
     if not api_key:
         return None, None
+    
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=api_key)
-        model = st.secrets.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20240620")
+        
+        # Obter modelo
+        model = "claude-3-5-sonnet-20240620"  # Modelo padrão
+        try:
+            if hasattr(st, 'secrets') and "ANTHROPIC_MODEL" in st.secrets:
+                model = st.secrets["ANTHROPIC_MODEL"]
+        except Exception:
+            model = os.environ.get("ANTHROPIC_MODEL", model)
+        
         return client, model
     except Exception as e:
         st.warning(f"Falha ao carregar Anthropic: {e}")
         return None, None
 
 def ensure_dirs_and_dbs():
+    """Cria diretórios e bancos de dados necessários"""
     os.makedirs(DATA_DIR, exist_ok=True)
     
     # Primeiro tenta restaurar do R2
@@ -604,84 +768,4 @@ def main():
         return
     
     # Interface principal (usuário autenticado)
-    st.title(f"🧪 {APP_TITLE}")
-    st.caption(f"Bem-vindo, **{st.session_state.username}**! | Dados sincronizados com Cloudflare R2")
-    
-    # Botão de logout no topo
-    col1, col2, col3 = st.columns([1, 1, 1])
-    with col3:
-        if st.button("🚪 Logout", key="main_logout"):
-            for key in ['authenticated', 'username', 'conv_id']:
-                if key in st.session_state:
-                    del st.session_state[key]
-            st.rerun()
-    
-    # Painel admin (apenas para admin)
-    if st.session_state.username == 'admin':
-        with st.expander("🛠️ Painel Administrativo"):
-            show_admin_panel()
-        st.divider()
-
-    # Interface original do app
-    with st.sidebar:
-        st.header("Configuração")
-        client, model = get_anthropic_client()
-        if client:
-            st.success(f"Anthropic configurado ({model})")
-        else:
-            st.info("Configure `ANTHROPIC_API_KEY` em Secrets do Streamlit Cloud.")
-
-        st.header("Indexação de PDFs")
-        docs_dir = st.text_input("Pasta com PDFs", value=DEFAULT_DOCS_DIR, key="sidebar_docs_dir")
-        if st.button("Indexar/Atualizar banco", key="sidebar_index"):
-            with st.spinner("Indexando PDFs..."):
-                nd, nc = index_folder(docs_dir)
-            st.success(f"Indexação: {nd} documentos, {nc} trechos.")
-
-        st.markdown("---")
-        st.subheader("Upload rápido (opcional)")
-        files = st.file_uploader("Adicione PDFs", type=["pdf"], accept_multiple_files=True, key="sidebar_upload")
-        if files:
-            os.makedirs(docs_dir, exist_ok=True)
-            saved = 0
-            for f in files:
-                out = os.path.join(docs_dir, f.name)
-                with open(out, "wb") as w:
-                    w.write(f.read())
-                saved += 1
-            st.success(f"{saved} PDF(s) salvo(s) em {docs_dir}. Clique em 'Indexar/Atualizar banco'.")
-
-    if "conv_id" not in st.session_state:
-        st.session_state.conv_id = start_conversation("Perguntas sobre Origin")
-
-    st.subheader("Pergunte com base nos PDFs")
-    question = st.text_input("Digite sua pergunta:", placeholder="Ex.: Como importar dados do Excel no Origin?", key="main_question")
-    if st.button("Responder", key="main_answer") and question.strip():
-        add_message(st.session_state.conv_id, "user", question.strip())
-        rows = search_chunks(question, TOP_K)
-        context_chunks = [r[0] for r in rows]
-        answer = llm_answer(question.strip(), context_chunks)
-        add_message(st.session_state.conv_id, "assistant", answer)
-
-    st.divider()
-    st.subheader("Conversas salvas")
-    cols = st.columns([3,1])
-    with cols[0]:
-        convs = list_conversations()
-        if convs:
-            labels = [f"#{cid} — {title} ({created_at.split('T')[0]})" for cid, title, created_at in convs]
-            idx = st.selectbox("Escolha uma conversa:", options=list(range(len(convs))), format_func=lambda i: labels[i], key="main_conv_select")
-            st.session_state.conv_id = convs[idx][0]
-    with cols[1]:
-        if st.button("Nova conversa", key="main_new_conv"):
-            st.session_state.conv_id = start_conversation("Nova conversa")
-            st.rerun()
-
-    if st.session_state.conv_id:
-        msgs = get_messages(st.session_state.conv_id)
-        for role, content, created in msgs:
-            with st.chat_message("user" if role == "user" else "assistant"):
-                st.markdown(content)
-
-if __name__ == "__main__":
-    main()
+    st.title(f"🧪 {APP_
